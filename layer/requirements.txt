@@ -1,0 +1,13 @@
+# Libraries packaged into the Lambda dependency layer.
+# Built by scripts/build_layer.sh from public PyPI (or Artifactory) for Python 3.12 / x86_64 (Amazon Linux wheels).
+#
+# Every third-party library the Lambda code imports directly is listed here, even though
+# awswrangler would pull pandas/numpy/pyarrow in anyway. pip picks versions compatible with awswrangler.
+# boto3 is NOT listed: the Lambda Python runtime already provides it.
+#
+# After the first successful build, pin exact versions here so every build is identical:
+#   pip freeze --path build/layer/python/lib/python3.12/site-packages
+awswrangler>=3,<4   # S3 read/write + Glue Catalog updates  (handler.py)
+pandas              # cleaning rules, join, summary          (rules.py, handler.py)
+numpy               # np.select for reject reasons           (rules.py)
+pyarrow             # Parquet engine used by pandas/awswrangler

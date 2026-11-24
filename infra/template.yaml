@@ -1,0 +1,344 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  NYC taxi pipeline (stack 2 of 2). S3 raw/ upload -> EventBridge rule -> Lambda transform ->
+  S3 curated/, quarantine/, summary/ -> Glue Data Catalog -> Athena. CloudWatch alarm -> SNS on failure.
+  The data bucket is created by infra/resources.yaml (stack 1) and passed in as DataBucketName.
+
+# Deploy with scripts/deploy.sh (deploys resources.yaml first, then this template).
+# Stack-level tags (project, owner, env) are applied by the deploy command to every taggable resource.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Ownership }
+        Parameters: [Owner, AlertEmail, DataBucketName]
+      - Label: { default: Runtime }
+        Parameters: [LayerS3Key, ReservedConcurrency, GlueDatabaseName, LambdaMemoryMB, LambdaTimeoutSeconds, LogRetentionDays]
+
+Parameters:
+  Owner:
+    Type: String
+    Description: Short owner name (lowercase letters and digits). Used in resource names so colleagues' stacks don't clash.
+    AllowedPattern: "^[a-z0-9]{2,20}$"
+    ConstraintDescription: 2-20 lowercase letters or digits.
+
+  AlertEmail:
+    Type: String
+    Description: Email address that receives failure alerts (confirm the SNS subscription email after deploying).
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    ConstraintDescription: Must be a valid email address.
+
+  DataBucketName:
+    Type: String
+    Description: Data bucket created by the resources stack (output DataBucketName).
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+
+  LayerS3Key:
+    Type: String
+    Description: S3 key of the dependency layer zip in the data bucket, e.g. artifacts/layers/taxi-pipeline-deps-py3.12-<hash>.zip.
+    AllowedPattern: "^artifacts/layers/[A-Za-z0-9._-]+\\.zip$"
+
+  ReservedConcurrency:
+    Type: Number
+    Default: 1
+    AllowedValues: [0, 1]
+    Description: >-
+      1 = only one run at a time (recommended). Use 0 if your account's Lambda concurrency
+      limit is too low to reserve any (common in new personal accounts).
+
+  GlueDatabaseName:
+    Type: String
+    Default: taxi_pipeline
+    Description: Glue Data Catalog database for the pipeline tables.
+    AllowedPattern: "^[a-z0-9_]{1,64}$"
+    ConstraintDescription: Lowercase letters, digits and underscores only.
+
+  LambdaMemoryMB:
+    Type: Number
+    Default: 3000
+    MinValue: 1024
+    MaxValue: 10240
+    Description: Lambda memory. January 2025 is 517 MB in memory; ~700 MB is the largest month in the last five years.
+
+  LambdaTimeoutSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: Lambda timeout. Tune after Pilot 1 using the Duration in the REPORT log line.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [7, 14, 30, 60, 90]
+    Description: CloudWatch Logs retention for the transform function.
+
+Conditions:
+  ReserveConcurrency: !Equals [!Ref ReservedConcurrency, "1"]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Transform (Lambda)
+  # ---------------------------------------------------------------------------
+  TransformLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/taxi-pipeline-transform-${Owner}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  TransformRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "taxi-pipeline-transform-${Owner}-${AWS::Region}"
+      Description: Least-privilege execution role for the taxi pipeline transform Lambda.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: taxi-pipeline-transform
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadRawInputs
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${DataBucketName}/raw/*"
+
+              - Sid: ReadWriteOutputs
+                Effect: Allow
+                Action:
+                  - s3:GetObject       # read back Parquet footers for the row-count check
+                  - s3:PutObject
+                  - s3:DeleteObject    # overwrite_partitions removes the month's old files
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${DataBucketName}/curated/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${DataBucketName}/quarantine/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${DataBucketName}/summary/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${DataBucketName}/manifests/*"
+
+              - Sid: ListPipelinePrefixes
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${DataBucketName}"
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - "raw/*"
+                      - "curated/*"
+                      - "quarantine/*"
+                      - "summary/*"
+                      - "manifests/*"
+
+              - Sid: GlueCatalogForPipelineDatabase
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:BatchGetPartition
+                  - glue:CreatePartition
+                  - glue:BatchCreatePartition
+                  - glue:UpdatePartition
+                  - glue:DeletePartition
+                  - glue:BatchDeletePartition
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/*"
+
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${TransformLogGroup.Arn}"
+
+  DependencyLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub "taxi-pipeline-deps-${Owner}"
+      Description: pandas, pyarrow (with zstd), numpy and awswrangler built from PyPI (scripts/build_layer.sh).
+      CompatibleRuntimes: [python3.12]
+      CompatibleArchitectures: [x86_64]
+      Content:
+        S3Bucket: !Ref DataBucketName
+        S3Key: !Ref LayerS3Key           # key changes when requirements change -> new layer version
+
+  TransformFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: TransformLogGroup
+    Properties:
+      FunctionName: !Sub "taxi-pipeline-transform-${Owner}"
+      Description: Cleans one month of taxi trips, quarantines bad rows, joins zones, builds the daily summary, checks counts.
+      Runtime: python3.12
+      Architectures: [x86_64]          # must match the layer build platform (manylinux2014_x86_64)
+      Handler: transform.handler.handler
+      Code: ../src                     # zipped and uploaded by `aws cloudformation package`
+      Role: !GetAtt TransformRole.Arn
+      Layers:
+        - !Ref DependencyLayer           # Ref returns the layer version ARN
+      MemorySize: !Ref LambdaMemoryMB
+      Timeout: !Ref LambdaTimeoutSeconds
+      # One run at a time, so two runs can never overwrite the same month's partitions simultaneously.
+      # Note: needs at least 1 unit of account concurrency free above the account's unreserved minimum.
+      ReservedConcurrentExecutions: !If [ReserveConcurrency, 1, !Ref AWS::NoValue]
+      Environment:
+        Variables:
+          BUCKET: !Ref DataBucketName
+          GLUE_DATABASE: !Ref GlueDatabaseName
+          LOG_LEVEL: INFO
+
+  TransformRetryConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref TransformFunction
+      Qualifier: $LATEST
+      # Failures are data problems (bad file name, missing lookup, count mismatch) that a retry won't fix.
+      MaximumRetryAttempts: 0
+      MaximumEventAgeInSeconds: 3600
+
+  # ---------------------------------------------------------------------------
+  # Trigger (EventBridge)
+  # ---------------------------------------------------------------------------
+  TripFileUploadedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "taxi-pipeline-trip-file-uploaded-${Owner}"
+      Description: Start the transform when a trip file lands in raw/yellow_tripdata/ (zone lookup and outputs are ignored).
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref DataBucketName
+          object:
+            key:
+              - wildcard: "raw/yellow_tripdata/*.parquet"
+      Targets:
+        - Id: TransformLambda
+          Arn: !GetAtt TransformFunction.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 3          # retries delivery to Lambda, not failed runs
+            MaximumEventAgeInSeconds: 3600
+
+  AllowEventBridgeInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TransformFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TripFileUploadedRule.Arn
+
+  # ---------------------------------------------------------------------------
+  # Catalog and query
+  # ---------------------------------------------------------------------------
+  CatalogDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: NYC taxi pipeline tables (created and updated by the transform Lambda).
+
+  AnalystWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "taxi-pipeline-${Owner}"
+      Description: Athena workgroup for querying the taxi pipeline tables.
+      State: ENABLED
+      RecursiveDeleteOption: true          # lets teardown delete the workgroup with its query history
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 10737418240   # 10 GB guard against runaway query cost
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${DataBucketName}/athena-results/"
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+
+  # ---------------------------------------------------------------------------
+  # Alerting
+  # ---------------------------------------------------------------------------
+  FailureTopic:
+    Type: AWS::SNS::Topic
+    # Left unencrypted deliberately: CloudWatch alarms cannot publish to a topic encrypted with the
+    # AWS-managed key (alias/aws/sns). Use a customer-managed KMS key if encryption is required.
+    Properties:
+      TopicName: !Sub "taxi-pipeline-failures-${Owner}"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  FailureTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref FailureTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref FailureTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:taxi-pipeline-*"
+
+  TransformErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "taxi-pipeline-transform-errors-${Owner}"
+      AlarmDescription: The taxi pipeline transform Lambda failed (including a failed row-count check). Check its CloudWatch logs.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TransformFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching       # the function runs rarely; no data means no failure
+      AlarmActions:
+        - !Ref FailureTopic
+      OKActions:
+        - !Ref FailureTopic
+
+Outputs:
+  TransformFunctionName:
+    Description: Transform Lambda function name (logs at /aws/lambda/<name>).
+    Value: !Ref TransformFunction
+  GlueDatabase:
+    Description: Glue Data Catalog database holding the pipeline tables.
+    Value: !Ref CatalogDatabase
+  DependencyLayerArn:
+    Description: Layer version currently attached to the transform function.
+    Value: !Ref DependencyLayer
+  AthenaWorkGroup:
+    Description: Athena workgroup to use for queries.
+    Value: !Ref AnalystWorkGroup
+  FailureTopicArn:
+    Description: SNS topic that receives failure alerts.
+    Value: !Ref FailureTopic
+  TripUploadPrefix:
+    Description: Upload trip files here to trigger the pipeline.
+    Value: !Sub "s3://${DataBucketName}/raw/yellow_tripdata/"
+  ZoneLookupPrefix:
+    Description: Upload the zone lookup here (before the first trip file).
+    Value: !Sub "s3://${DataBucketName}/raw/taxi_zone_lookup/"

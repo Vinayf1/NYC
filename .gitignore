@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Build output
+packaged.yaml
+*.zip
+.aws-sam/
+build/
+
+# Local data (never commit raw data)
+data/
+*.parquet
+*.csv
+
+# Secrets and credentials (never commit)
+.env
+.env.*
+*.pem
+*.key
+.aws/
+credentials
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+build/
+packaged.yaml
+__pycache__/
+*.pyc
+.env
